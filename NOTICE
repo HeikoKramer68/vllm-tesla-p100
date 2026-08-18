@@ -1,0 +1,13 @@
+vLLM Pascal Support Fork
+
+This product includes software developed by the vLLM project
+(https://github.com/vllm-project/vllm), licensed under the Apache
+License, Version 2.0.
+
+Pascal / NVIDIA Tesla P40 (SM 6.1) support was developed by
+uaysk <uaysk0327@gmail.com>
+(https://github.com/uaysk/vllm-pascal).
+
+Additional modifications for NVIDIA Tesla P100 (SM 6.0) compatibility
+are Copyright 2026 Heiko Kramer <pascal.lives26@gmail.com>,
+licensed under the Apache License, Version 2.0.
