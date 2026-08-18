@@ -1,392 +1,489 @@
-<!-- markdownlint-disable MD001 MD041 -->
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+# vllm-tesla-p100
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+**vLLM for NVIDIA Tesla P100 (SM 6.0).** Extends the Pascal/P40 fork by
+[uaysk](https://github.com/uaysk/vllm-pascal) to support the Tesla P100
+(GP100), with a complete benchmark matrix covering 2×/6× P100 and 4× RTX
+3090.
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+> ⚠️ **Draft / work in progress.** This README is an initial draft and
+> will be revised further. Verify values, commands, and notes before
+> production use.
 
-🔥 We have built a vllm website to help you get started with vllm. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+------------------------------------------------------------------------
 
----
+## What is this?
 
-## Tesla P40 Build And Run
+vLLM officially runs on Volta (SM 7.0) and newer. There is no official
+Pascal support. uaysk ported vLLM to the **Tesla P40** (GP102, SM 6.1);
+this fork additionally brings it to the **Tesla P100** (GP100, SM 6.0)
+and documents its behavior with reproducible benchmarks.
 
-This fork is patched to run vLLM on NVIDIA Tesla P40 / Pascal (`sm_61`) and
-has been validated with `Qwen/Qwen3-ASR-1.7B`,
-`mistralai/Voxtral-Mini-4B-Realtime-2602`, and
-`opendatalab/MinerU2.5-2509-1.2B`.
+The core modification: Pascal has no native bf16/FP8 units. At the
+affected locations (`cast_to_float2`, `silu2_v2`, `warp_max`, `clip`),
+`#if __CUDA_ARCH__ >= 800` guards introduce fallback paths that use
+conversion through `float` on Pascal instead of unavailable intrinsics.
 
-Tested environment:
+------------------------------------------------------------------------
 
-- OS: Ubuntu 24.04 / Linux x86_64
-- GPU: Tesla P40 (`sm_61`)
-- Python: `3.12.3`
-- Virtual environment: `.venv-p40`
-- PyTorch: `2.5.1+cu121`
-- CUDA runtime from PyTorch wheel: `12.1`
-- CUDA toolkit used for local source build: `12.2` (`/usr/local/cuda-12.2`)
-- Host compiler used for `nvcc`: `gcc-12` / `g++-12`
-- System default GCC on this machine: `13.3.0`
-- Recommended install mode: in a dedicated `venv`, then `pip install -e . --no-build-isolation`
+## Origin & Attribution
 
-Validated models on this fork:
+This fork builds on two layers of prior work:
 
-- `Qwen/Qwen3-ASR-1.7B`
-- `mistralai/Voxtral-Mini-4B-Realtime-2602`
-- `opendatalab/MinerU2.5-2509-1.2B`
+-   **vLLM** (base, Apache 2.0) -- commit `36e14f2c1` (2026-07-05, CUDA
+    12.1)
+-   **uaysk/vllm-pascal** -- Pascal/P40 support (SM 6.1), including bf16
+    packing fix
+-   **This fork** -- Tesla P100 compatibility (SM 6.0) + benchmarks
 
-The commands below are the reproducible path used to build and run this fork on P40.
+See [`NOTICE`](./NOTICE) for details. Modified CUDA files contain the
+corresponding headers. License: **Apache 2.0** (unchanged from vLLM).
 
-### 1. Install system packages required by the current build environment
+------------------------------------------------------------------------
 
-The current machine is Ubuntu 24.04 and `nvcc 12.2` does not accept the
-default `gcc 13` toolchain. Install and use `gcc-12` / `g++-12`.
+## Benchmark Matrix
 
-```bash
+All values use the same prompt, `temperature=0.0`, `max_tokens=512`.
+tok/s = decode throughput (generation), unless otherwise stated.
+
+  Model   Quant   Hardware   Configuration      tok/s
+  ------- ------- ---------- ------------------ --------------
+  14B     INT8    2× P100    TP2, eager         \~12.4--13.4
+  14B     FP16    4× P100    TP4, eager         13.6
+  14B     FP16    2× P100    torch, Pipeline    7.8
+  14B     INT8    4× 3090    TP4, CUDA Graphs   68.1
+  14B     FP16    4× 3090    TP4, CUDA Graphs   \~57
+  32B     FP16    6× P100    TP2/PP3, eager     6.7
+  32B     FP16    4× 3090    TP4, CUDA Graphs   32.7
+  32B     FP16    4× 3090    TP4, eager         12.1
+  32B     INT8    4× 3090    TP4, CUDA Graphs   47.1
+  72B     INT8    4× 3090    TP4, CUDA Graphs   \~26
+  72B     INT8    6× P100    TP2/PP3, eager     7.13
+
+Models: Qwen2.5-Instruct (14B/32B/72B), INT8 using GPTQ.
+
+**Note:** 14B FP16 does **not** run under vLLM on 2× P100 (the KV cache
+does not fit in memory). Use INT8 on this hardware, or FP16 with at
+least 4 cards.
+
+------------------------------------------------------------------------
+
+## Key Finding: Eager Mode Costs \~2.7×
+
+On Pascal, `enforce_eager` is currently required. The comparison on 4×
+3090 (32B FP16) shows the performance cost:
+
+-   **eager:** 12.1 tok/s
+-   **CUDA Graphs:** 32.7 tok/s → **2.7× faster**
+
+**Hypothesis:** The eager requirement is not caused by the bf16 patch,
+but by **Triton**. At startup,
+`No module named 'triton.language.target_info'` appears, which prevents
+CUDA Graph capture. A Triton version that supports SM 6.0 and provides
+this module could potentially remove the eager requirement and deliver a
+similar performance gain on P100 (72B: from 7.13 to an estimated
+\~17--19 tok/s).
+
+👉 **This is [Issue #1](../../issues/1) and an invitation to the
+community.** If you know a suitable Triton version in the torch 2.5.1 /
+CUDA 12.1 / SM 6.0 window, you are very welcome to test it.
+
+------------------------------------------------------------------------
+
+## Installation
+
+Tested on **Ubuntu 24.04, CUDA 12.1, PyTorch 2.5.1**.
+
+> **Driver note:** Install the CUDA toolkit, but **deselect the driver
+> bundled with the toolkit**. Keep the distribution-provided driver
+> instead (for example, 535). Newer drivers may restrict Pascal support.
+> The toolkit provides the compiler and libraries; the distro driver
+> provides the runtime.
+
+``` bash
+# 1. Clone the repository and enter it
+git clone https://github.com/HeikoKramer68/vllm-tesla-p100.git
+cd vllm-tesla-p100
+
+# 2. Create and activate a virtual environment
+python3.12 -m venv venv
+source venv/bin/activate
+
+# 3. System build tools
 sudo apt update
-sudo apt install -y \
-  python3.12-venv \
-  gcc-12 \
-  g++-12 \
-  cmake \
-  ninja-build
+sudo apt install -y cmake ninja-build python3.12-dev gcc-12 g++-12
+
+# 4. Set the build environment (CUDA path, compiler, target architecture SM 6.0)
+source build-env.sh
+
+# 5. Python build tools
+python -m pip install --upgrade pip setuptools wheel setuptools_scm
+
+# 6. Use the existing PyTorch installation for the build
+python use_existing_torch.py
+
+# 7. Remove old build artifacts (if present)
+rm -rf build .deps
+
+# 8. Compile and install the fork in editable mode
+python -m pip install -v -e . --no-build-isolation
 ```
 
-### 2. Clone the fork
+The central Pascal setting is defined in
+[`build-env.sh`](./build-env.sh): `TORCH_CUDA_ARCH_LIST="6.0"`. Without
+it, the build targets the wrong architecture.
 
-```bash
-git clone https://github.com/uaysk/vllm-pascal.git
-cd vllm-pascal
+> **TODO (author verification):** Confirm whether `VLLM_USE_V1=0` must
+> be set at runtime (old engine), and document it here.
+
+------------------------------------------------------------------------
+
+## Configuration Notes
+
+When running on multiple Pascal cards, keep the following in mind:
+
+-   **Tensor Parallel must divide the number of attention heads.**
+    Qwen2.5 has 40 heads → not divisible by 6. For 6 cards, use
+    `TP=2 / PP=3` or `TP=5`, not `TP=6`.
+-   **Pipeline Parallel works only through the API server**, not
+    directly through the `LLM()` object.
+-   **KV-cache overflow ≠ hallucination.** If output degrades into
+    repetition or word salad after a certain length, `max_model_len` is
+    too small; this is not a model failure. Set `max_model_len`
+    significantly larger than (prompt + max_tokens), with additional
+    headroom.
+-   **Mount RAID via fstab/UUID**, not through `/media` automount, to
+    avoid path inconsistencies.
+
+------------------------------------------------------------------------
+
+## Startup Messages That Can Be Ignored
+
+These messages may appear at startup and can be **ignored**; the server
+runs normally:
+
+``` text
+ERROR ... Failed to import Triton kernels ... No module named 'triton.language.target_info'
 ```
 
-### 3. Create and activate a virtual environment
+→ Affects MoE kernels (for example GPT-OSS). Irrelevant for dense models
+such as Qwen2.5.
 
-```bash
-python3.12 -m venv .venv-p40
-source .venv-p40/bin/activate
-python -m pip install --upgrade pip
+``` text
+SymmMemCommunicator: Device capability 6.0 not supported
 ```
 
-### 4. Install Python build tools
+→ Pascal does not support this communication feature; vLLM uses a
+fallback.
 
-```bash
-python -m pip install \
-  "setuptools>=77,<81" \
-  wheel \
-  packaging \
-  cmake \
-  ninja \
-  jinja2 \
-  regex \
-  protobuf
+``` text
+Custom allreduce is disabled ... PCIe-only GPUs
 ```
 
-### 5. Install a P40-compatible PyTorch stack
+→ No NVLink; the normal communication path is used. Expected behavior.
 
-The fork has been tested with CUDA 12.1 wheels. This is separate from the local
-CUDA toolkit used to compile extensions.
+------------------------------------------------------------------------
 
-```bash
-python -m pip install \
-  --index-url https://download.pytorch.org/whl/cu121 \
-  torch==2.5.1 \
-  torchvision==0.20.1 \
-  torchaudio==2.5.1
-```
+## Hardware
 
-Verify that PyTorch sees the P40 correctly:
+Tested on Dell R720 with:
 
-```bash
-python - <<'PY'
-import torch
-print("torch:", torch.__version__)
-print("cuda:", torch.version.cuda)
-print("device:", torch.cuda.get_device_name(0))
-print("capability:", torch.cuda.get_device_capability(0))
-PY
-```
+-   2× / 6× Tesla P100-PCIE-16GB (passively cooled, with attached fans)
+-   4× RTX 3090 (comparison system)
 
-Expected capability on Tesla P40:
+Build notes:
 
-```text
-(6, 1)
-```
+-   Risers with x16 connectivity (with 4 or more cards, slots drop to
+    x8)
+-   Symmetrical distribution across both CPU sockets
+-   Passive P100 cards require active airflow (attached fans are
+    sufficient)
 
-### 6. Configure the local CUDA 12.2 toolchain used for source builds
+*(Photos to follow: the rig and a run under load with nvidia-smi.)*
 
-```bash
-export CUDA_HOME=/usr/local/cuda-12.2
-export PATH="$CUDA_HOME/bin:$PATH"
-export LD_LIBRARY_PATH="$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}"
-export CC=/usr/bin/gcc-12
-export CXX=/usr/bin/g++-12
-export CMAKE_ARGS="-DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-12"
-```
+------------------------------------------------------------------------
 
-Confirm the compiler and toolkit before building:
+## Why This Exists
 
-```bash
-nvcc --version
-g++-12 --version | head -n 1
-```
+Local AI inference does not have to start with the most expensive
+hardware. A used Tesla P100 costs a fraction of a current-generation
+GPU. For anyone looking for a local entry point for a few hundred euros,
+this project provides a way to run vLLM at all. It is not intended as a
+replacement for modern hardware, but as an open door for people who
+would otherwise be left out.
 
-### 7. Build and install this fork for Pascal
-
-```bash
-export VLLM_TARGET_DEVICE=cuda
-export TORCH_CUDA_ARCH_LIST="6.1"
-python -m pip install -e . --no-build-isolation
-```
-
-If you want to reduce parallel build pressure on an older host:
-
-```bash
-export MAX_JOBS=1
-```
-
-and then run the same install command again.
-
-If you build without `g++-12`, `nvcc 12.2` can fail early with an
-`unsupported GNU version` error on Ubuntu 24.04 because the system default is
-GCC 13.
-
-### 8. Install runtime packages used for Qwen ASR, Voxtral, and MinerU validation
-
-```bash
-python -m pip install librosa soundfile pillow "mineru-vl-utils[vllm]"
-```
-
-### 9. Start the OpenAI-compatible API server for Qwen3-ASR on P40
-
-For P40, the stable runtime path is eager execution with conservative scheduler settings:
-
-```bash
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-vllm serve Qwen/Qwen3-ASR-1.7B \
-  --host 0.0.0.0 \
-  --port 8010 \
-  --served-model-name qwen3-asr-rt \
-  --hf-overrides '{"architectures":["Qwen3ASRRealtimeGeneration"]}' \
-  --max-model-len 4096 \
-  --max-num-seqs 1 \
-  --gpu-memory-utilization 0.85 \
-  --limit-mm-per-prompt '{"audio":1}' \
-  --enforce-eager \
-  --disable-log-stats \
-  --no-enable-prefix-caching \
-  --no-enable-chunked-prefill \
-  --no-async-scheduling
-```
-
-If you already have the model in a local Hugging Face snapshot directory, replace `Qwen/Qwen3-ASR-1.7B` with that local path.
-
-### 10. Start the OpenAI-compatible API server for MinerU2.5 on P40
-
-`opendatalab/MinerU2.5-2509-1.2B` uses the existing `Qwen2-VL` model path in
-vLLM. The official model card recommends a logits processor for
-`no_repeat_ngram_size`; this fork includes that processor built in, so you do
-not need an extra `--logits-processors` flag.
-
-The model card is published with `torch_dtype=bfloat16`, but Tesla P40 does not
-support BF16. Use `--dtype half` explicitly for Pascal:
-
-```bash
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-vllm serve opendatalab/MinerU2.5-2509-1.2B \
-  --host 0.0.0.0 \
-  --port 8011 \
-  --served-model-name mineru25-p40 \
-  --dtype half \
-  --max-model-len 4096 \
-  --limit-mm-per-prompt '{"image":1}' \
-  --gpu-memory-utilization 0.85 \
-  --enforce-eager \
-  --max-num-seqs 1 \
-  --disable-log-stats \
-  --no-enable-prefix-caching \
-  --no-enable-chunked-prefill \
-  --no-async-scheduling
-```
-
-If you already downloaded the model to a local Hugging Face snapshot directory,
-replace `opendatalab/MinerU2.5-2509-1.2B` with that local path.
-
-Minimal extraction example with `mineru-vl-utils`:
-
-```bash
-python - <<'PY'
-from PIL import Image
-from mineru_vl_utils import MinerUClient
-
-client = MinerUClient(
-    backend="http-client",
-    server_url="http://127.0.0.1:8011",
-)
-
-image = Image.open("/path/to/page.png")
-blocks = client.two_step_extract(image)
-print(blocks[:3])
-PY
-```
-
-Validated MinerU result on this P40 environment:
-
-- Model path: local Hugging Face snapshot of `opendatalab/MinerU2.5-2509-1.2B`
-- Test input: single document page image through `MinerUClient.two_step_extract`
-- Observed cold load time: about `143s`
-- Observed layout detect time: about `82s`
-- Observed extract time: about `134s` on the first run
-- Output quality check: document header, journal line, figure caption, and formula text were extracted correctly on the validation sample
-
-Two warnings can still appear during layout detection on the validation sample:
-
-- `Warning: The output was truncated due to length limit.`
-- `Warning: line does not match layout format: <|box_start|>844 119 958 124`
-
-In the validated P40 run these warnings did not prevent extraction; the model still returned `122` parsed blocks successfully.
-
-### 11. Start the OpenAI-compatible realtime API server for Voxtral Mini 4B on P40
-
-`Voxtral Mini 4B Realtime` support is included in this fork for Pascal/P40.
-Use the same conservative runtime settings as the validated path:
-
-```bash
-export VLLM_WORKER_MULTIPROC_METHOD=spawn
-vllm serve mistralai/Voxtral-Mini-4B-Realtime-2602 \
-  --host 0.0.0.0 \
-  --port 8012 \
-  --served-model-name voxtral-mini-rt \
-  --enforce-eager \
-  --tokenizer-mode mistral \
-  --config-format mistral \
-  --load-format mistral \
-  --max-model-len 4096 \
-  --max-num-seqs 1 \
-  --gpu-memory-utilization 0.85 \
-  --disable-log-stats \
-  --no-enable-prefix-caching \
-  --no-enable-chunked-prefill \
-  --no-async-scheduling
-```
-
-Client examples for the realtime WebSocket endpoint are available in:
-
-- `examples/online_serving/openai_realtime_client.py`
-- `examples/online_serving/openai_realtime_microphone_client.py`
-- `examples/online_serving/openai_realtime_upload_web_demo.py`
-
-### 12. Verify basic health
-
-```bash
-curl http://127.0.0.1:8010/health
-curl http://127.0.0.1:8010/v1/models
-curl http://127.0.0.1:8011/health
-curl http://127.0.0.1:8011/v1/models
-curl http://127.0.0.1:8012/health
-curl http://127.0.0.1:8012/v1/models
-```
-
-### 13. Known P40-specific runtime notes
-
-- This fork intentionally avoids FlashAttention/FlashInfer-style fast paths that are not usable on Pascal.
-- For Qwen3-ASR on P40, use the serve flags shown above. Removing them can reintroduce crashes or unstable behavior.
-- Voxtral realtime support is included for Pascal/P40 in this fork.
-- On Pascal, Voxtral realtime uses safer attention/backend fallbacks instead of unstable Triton paths.
-- For MinerU2.5 on P40, force `--dtype half` and keep `--max-num-seqs 1` unless you have verified a larger concurrency setting on your card.
-- MinerU2.5 uses the existing Qwen2-VL implementation in this fork; Pascal uses safe pre-Volta attention fallbacks for the vision path.
-- This fork includes built-in handling for MinerU's `no_repeat_ngram_size` extra arg, so `mineru-vl-utils` works without adding a separate logits processor plugin.
-- The validated path is vLLM serving plus Qwen3-ASR transcription / realtime transcription on P40, Voxtral Mini 4B Realtime serving on P40, and MinerU2.5 document parsing on P40.
-- Browser microphone capture still requires `localhost` or `HTTPS`; that is a browser security rule, not a vLLM limitation.
-
-## About
-
-vLLM is a fast and easy-to-use library for LLM inference and serving.
-
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has evolved into a community-driven project with contributions from both academia and industry.
-
-vLLM is fast with:
-
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests
-- Fast model execution with CUDA/HIP graph
-- Quantizations: [GPTQ](https://arxiv.org/abs/2210.17323), [AWQ](https://arxiv.org/abs/2306.00978), [AutoRound](https://arxiv.org/abs/2309.05516), INT4, INT8, and FP8
-- Optimized CUDA kernels, including integration with FlashAttention and FlashInfer
-- Speculative decoding
-- Chunked prefill
-
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data and expert parallelism support for distributed inference
-- Streaming outputs
-- OpenAI-compatible API server
-- Support for NVIDIA GPUs, AMD CPUs and GPUs, Intel CPUs and GPUs, PowerPC CPUs, Arm CPUs, and TPU. Additionally, support for diverse hardware plugins such as Intel Gaudi, IBM Spyre and Huawei Ascend.
-- Prefix caching support
-- Multi-LoRA support
-
-vLLM seamlessly supports most popular open-source models on HuggingFace, including:
-
-- Transformer-like LLMs (e.g., Llama)
-- Mixture-of-Expert LLMs (e.g., Mixtral, Deepseek-V2 and V3)
-- Embedding Models (e.g., E5-Mistral)
-- Multi-modal LLMs (e.g., LLaVA)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with `pip` or [from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source):
-
-```bash
-pip install vllm
-```
-
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
+------------------------------------------------------------------------
 
 ## Contributing
 
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
+The biggest open issue is [Issue #1](../../issues/1) (eager mode /
+Triton). If you have Pascal hardware, reproduce the build, or make
+progress on the Triton issue, PRs and feedback are welcome.
 
-## Citation
+Contact: `pascal.lives26@gmail.com`
 
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
+------------------------------------------------------------------------
 
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
+*Built on the work of [uaysk](https://github.com/uaysk/vllm-pascal) and
+the [vLLM project](https://github.com/vllm-project/vllm).*
+
+---
+
+## Example Server: Qwen2.5-72B GPTQ INT8 on 6× Tesla P100
+
+This example starts the OpenAI-compatible vLLM API server on six Tesla P100
+cards using `TP=2 / PP=3`. It is the same basic configuration used for the
+72B GPTQ INT8 tests. Only change the model path to match your local setup.
+
+Save as `server.py`:
+
+```python
+import os
+import subprocess
+import sys
+
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+os.environ.pop("VLLM_USE_V1", None)
+
+cmd = [
+    sys.executable,
+    "-m",
+    "vllm.entrypoints.openai.api_server",
+
+    "--model", "/path/to/Qwen2.5-72B-Instruct-GPTQ-Int8",
+    "--served-model-name", "qwen72b",
+
+    "--quantization", "gptq",
+    "--dtype", "half",
+
+    "--tensor-parallel-size", "2",
+    "--pipeline-parallel-size", "3",
+
+    "--max-model-len", "4096",
+    "--gpu-memory-utilization", "0.95",
+
+    "--enforce-eager",
+    "--disable-custom-all-reduce",
+
+    "--host", "0.0.0.0",
+    "--port", "8000",
+]
+
+subprocess.run(cmd, check=True)
 ```
 
-## Contact Us
+Start it with:
 
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
+```bash
+python server.py
+```
 
-## Media Kit
+---
 
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+## Simple Streaming Test Client
+
+This client connects to the OpenAI-compatible API endpoint, streams the model
+response directly to the terminal, and measures basic performance data. It
+reports time to first token (TTFT), decode time, total time, and decode
+tokens per second. This makes it useful both as a minimal chat client and as a
+quick sanity/performance test after installation.
+
+Install the only additional dependency:
+
+```bash
+python -m pip install requests
+```
+
+Save the following as `client.py`:
+
+```python
+import json
+import time
+from typing import Optional
+
+import requests
+
+
+URL = "http://127.0.0.1:8000/v1/chat/completions"
+MODEL = "qwen72b"
+
+MAX_TOKENS = 512
+TEMPERATURE = 0.0
+TOP_P = 0.9
+
+REQUEST_TIMEOUT = 600
+
+
+def ask_model(prompt: str) -> None:
+    payload = {
+        "model": MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "max_tokens": MAX_TOKENS,
+        "temperature": TEMPERATURE,
+        "top_p": TOP_P,
+        "stream": True,
+    }
+
+    start_time = time.perf_counter()
+    first_token_time: Optional[float] = None
+
+    text_parts: list[str] = []
+    stream_chunks = 0
+    usage_completion_tokens: Optional[int] = None
+    finish_reason: Optional[str] = None
+
+    try:
+        with requests.post(
+            URL,
+            json=payload,
+            stream=True,
+            timeout=REQUEST_TIMEOUT,
+        ) as response:
+
+            if not response.ok:
+                print("\nServer error:")
+                print(f"HTTP {response.status_code}")
+                print(response.text)
+                return
+
+            print("\nResponse:\n")
+
+            for raw_line in response.iter_lines(decode_unicode=True):
+                if not raw_line:
+                    continue
+
+                line = raw_line.strip()
+
+                if line.startswith("data:"):
+                    line = line[5:].strip()
+
+                if line == "[DONE]":
+                    break
+
+                try:
+                    chunk = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                if "error" in chunk:
+                    print("\nAPI error:")
+                    print(json.dumps(chunk["error"], indent=2, ensure_ascii=False))
+                    return
+
+                choices = chunk.get("choices", [])
+
+                if choices:
+                    choice = choices[0]
+                    delta = choice.get("delta", {})
+
+                    token_text = delta.get("content", "")
+
+                    if token_text:
+                        now = time.perf_counter()
+
+                        if first_token_time is None:
+                            first_token_time = now
+
+                        stream_chunks += 1
+                        text_parts.append(token_text)
+
+                        print(token_text, end="", flush=True)
+
+                    if choice.get("finish_reason") is not None:
+                        finish_reason = choice["finish_reason"]
+
+                usage = chunk.get("usage")
+
+                if usage:
+                    usage_completion_tokens = usage.get("completion_tokens")
+
+    except requests.exceptions.ConnectionError:
+        print("\n\nCould not connect to the server.")
+        print(f"Checked address: {URL}")
+        return
+
+    except requests.exceptions.Timeout:
+        print("\n\nTimed out while waiting for the server.")
+        return
+
+    except requests.exceptions.RequestException as exc:
+        print(f"\n\nHTTP error: {exc}")
+        return
+
+    end_time = time.perf_counter()
+
+    total_elapsed = end_time - start_time
+
+    if first_token_time is not None:
+        prefill_time = first_token_time - start_time
+        decode_time = end_time - first_token_time
+    else:
+        prefill_time = 0.0
+        decode_time = 0.0
+
+    completion_tokens = (
+        usage_completion_tokens
+        if usage_completion_tokens is not None
+        else stream_chunks
+    )
+
+    decode_tps = (
+        completion_tokens / decode_time
+        if decode_time > 0
+        else 0.0
+    )
+
+    print("\n\n--- Statistics ---")
+    print(f"Completion Tokens:  {completion_tokens}")
+
+    if usage_completion_tokens is None:
+        print(f"Stream Chunks:       {stream_chunks}")
+        print("Note: Without usage data, stream chunks are not exact token counts.")
+
+    print(f"Prefill (TTFT):      {prefill_time:.2f} s")
+    print(f"Decode Time:         {decode_time:.2f} s")
+    print(f"Total Time:          {total_elapsed:.2f} s")
+    print(f"Decode Tokens/s:     {decode_tps:.2f}")
+
+    if finish_reason is not None:
+        print(f"Finish Reason:       {finish_reason}")
+
+    print()
+
+
+def main() -> None:
+    print("Qwen Chat Client")
+    print(f"Server: {URL}")
+    print(f"Model: {MODEL}")
+    print("Exit with: exit, quit, or q")
+
+    while True:
+        try:
+            prompt = input("\nPrompt: ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print("\nClient stopped.")
+            break
+
+        if prompt.lower() in {"exit", "quit", "q"}:
+            print("Client stopped.")
+            break
+
+        if not prompt:
+            continue
+
+        ask_model(prompt)
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Run it with:
+
+```bash
+python client.py
+```
