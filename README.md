@@ -47,17 +47,17 @@ tok/s = decode throughput (generation), unless otherwise stated.
 
   Model   Quant   Hardware   Configuration      tok/s
   ------- ------- ---------- ------------------ --------------
-  14B     INT8    2× P100    TP2, eager         \~12.4--13.4
-  14B     FP16    4× P100    TP4, eager         13.6
-  14B     FP16    2× P100    torch, Pipeline    7.8
-  14B     INT8    4× 3090    TP4, CUDA Graphs   68.1
-  14B     FP16    4× 3090    TP4, CUDA Graphs   \~57
-  32B     FP16    6× P100    TP2/PP3, eager     6.7
-  32B     FP16    4× 3090    TP4, CUDA Graphs   32.7
-  32B     FP16    4× 3090    TP4, eager         12.1
-  32B     INT8    4× 3090    TP4, CUDA Graphs   47.1
-  72B     INT8    4× 3090    TP4, CUDA Graphs   \~26
-  72B     INT8    6× P100    TP2/PP3, eager     7.13
+  14B     INT8    2× P100    TP2, eager         12.4--13.4 tks/
+  14B     FP16    4× P100    TP4, eager         13.6 tks/
+  14B     FP16    2× P100    torch, Pipeline    7.8 tks/
+  14B     INT8    4× 3090    TP4, CUDA Graphs   68.1 tks/
+  14B     FP16    4× 3090    TP4, CUDA Graphs   57tks/
+  32B     FP16    6× P100    TP2/PP3, eager     6.7 tks/
+  32B     FP16    4× 3090    TP4, CUDA Graphs   32.7 tks/
+  32B     FP16    4× 3090    TP4, eager         12.1 tks/
+  32B     INT8    4× 3090    TP4, CUDA Graphs   47.1 tks/
+  72B     INT8    4× 3090    TP4, CUDA Graphs   26 tks
+  72B     INT8    6× P100    TP2/PP3, eager     7.13 tks
 
 Models: Qwen2.5-Instruct (14B/32B/72B), INT8 using GPTQ.
 
