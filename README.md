@@ -67,27 +67,6 @@ least 4 cards.
 
 ------------------------------------------------------------------------
 
-## Key Finding: Eager Mode Costs \~2.7×
-
-On Pascal, `enforce_eager` is currently required. The comparison on 4×
-3090 (32B FP16) shows the performance cost:
-
--   **eager:** 12.1 tok/s
--   **CUDA Graphs:** 32.7 tok/s → **2.7× faster**
-
-**Hypothesis:** The eager requirement is not caused by the bf16 patch,
-but by **Triton**. At startup,
-`No module named 'triton.language.target_info'` appears, which prevents
-CUDA Graph capture. A Triton version that supports SM 6.0 and provides
-this module could potentially remove the eager requirement and deliver a
-similar performance gain on P100 (72B: from 7.13 to an estimated
-\~17--19 tok/s).
-
-👉 **This is [Issue #1](../../issues/1) and an invitation to the
-community.** If you know a suitable Triton version in the torch 2.5.1 /
-CUDA 12.1 / SM 6.0 window, you are very welcome to test it.
-
-------------------------------------------------------------------------
 
 ## Installation
 
